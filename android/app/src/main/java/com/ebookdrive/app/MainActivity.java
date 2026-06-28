@@ -2,11 +2,10 @@ package com.ebookdrive.app;
 
 import android.Manifest;
 import android.app.Activity;
-import android.app.DownloadManager;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.net.Uri;
+import android.media.MediaScannerConnection;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
@@ -22,17 +21,24 @@ import android.widget.ListView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.conscrypt.Conscrypt;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
+import java.security.Security;
 import java.util.ArrayList;
 import java.util.List;
+
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
 
 public class MainActivity extends Activity {
 
@@ -51,6 +57,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        setupModernTls();
         setContentView(R.layout.activity_main);
 
         codeInput = findViewById(R.id.code);
@@ -62,7 +69,7 @@ public class MainActivity extends Activity {
         listView.setAdapter(adapter);
 
         SharedPreferences sp = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        String saved = sp.getString(KEY_CODE, "");
+        final String saved = sp.getString(KEY_CODE, "");
         if (!TextUtils.isEmpty(saved)) {
             codeInput.setText(saved);
         }
@@ -96,6 +103,18 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** Install Conscrypt so HTTPS uses TLS 1.2/1.3 even on Android 4.x (whose system SSL is too old). */
+    private void setupModernTls() {
+        try {
+            Security.insertProviderAt(Conscrypt.newProvider(), 1);
+            SSLContext ctx = SSLContext.getInstance("TLS");
+            ctx.init(null, null, null);
+            HttpsURLConnection.setDefaultSSLSocketFactory(ctx.getSocketFactory());
+        } catch (Throwable t) {
+            // If this fails, connections will fall back to the system SSL.
+        }
+    }
+
     private void requestStorageIfNeeded() {
         if (Build.VERSION.SDK_INT >= 23 && Build.VERSION.SDK_INT <= 28) {
             if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
@@ -126,8 +145,8 @@ public class MainActivity extends Activity {
                 try {
                     URL url = new URL(BASE + "/api/list?code=" + enc(code));
                     conn = (HttpURLConnection) url.openConnection();
-                    conn.setConnectTimeout(15000);
-                    conn.setReadTimeout(15000);
+                    conn.setConnectTimeout(20000);
+                    conn.setReadTimeout(20000);
                     int sc = conn.getResponseCode();
                     if (sc == 401) {
                         err = "코드가 올바르지 않습니다.";
@@ -172,23 +191,67 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    private void download(String name, String code) {
-        try {
-            String url = BASE + "/api/download?name=" + enc(name) + "&code=" + enc(code);
-            DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
-            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
-            req.setTitle(name);
-            req.setDescription("ebook-drive");
-            req.setNotificationVisibility(
-                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-            req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);
-            req.allowScanningByMediaScanner();
-            dm.enqueue(req);
-            Toast.makeText(this, "다운로드 시작: " + name, Toast.LENGTH_SHORT).show();
-            status.setText("다운로드: Download/" + name);
-        } catch (Exception e) {
-            Toast.makeText(this, "다운로드 실패: " + e.getMessage(), Toast.LENGTH_LONG).show();
-        }
+    private void download(final String name, final String code) {
+        status.setText("다운로드 중: " + name);
+        final Context ctx = this;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String err = null;
+                File outFile = null;
+                HttpURLConnection conn = null;
+                try {
+                    URL url = new URL(BASE + "/api/download?name=" + enc(name) + "&code=" + enc(code));
+                    conn = (HttpURLConnection) url.openConnection();
+                    conn.setConnectTimeout(20000);
+                    conn.setReadTimeout(60000);
+                    int sc = conn.getResponseCode();
+                    if (sc == 401) {
+                        err = "코드가 올바르지 않습니다.";
+                    } else if (sc != 200) {
+                        err = "오류: " + sc;
+                    } else {
+                        File dir = Environment.getExternalStoragePublicDirectory(
+                                Environment.DIRECTORY_DOWNLOADS);
+                        if (!dir.exists()) dir.mkdirs();
+                        outFile = new File(dir, name);
+                        InputStream in = conn.getInputStream();
+                        FileOutputStream out = new FileOutputStream(outFile);
+                        byte[] buf = new byte[8192];
+                        int n;
+                        while ((n = in.read(buf)) != -1) {
+                            out.write(buf, 0, n);
+                        }
+                        out.flush();
+                        out.close();
+                        in.close();
+                    }
+                } catch (Exception e) {
+                    err = "다운로드 실패: " + e.getMessage();
+                } finally {
+                    if (conn != null) conn.disconnect();
+                }
+                final String fErr = err;
+                final File fOut = outFile;
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (fErr != null) {
+                            status.setText(fErr);
+                            Toast.makeText(ctx, fErr, Toast.LENGTH_LONG).show();
+                        } else {
+                            status.setText("저장됨: Download/" + name);
+                            Toast.makeText(ctx, "저장됨: Download/" + name, Toast.LENGTH_SHORT).show();
+                            try {
+                                MediaScannerConnection.scanFile(ctx,
+                                        new String[]{fOut.getAbsolutePath()}, null, null);
+                            } catch (Exception ignore) {
+                            }
+                        }
+                    }
+                });
+            }
+        }).start();
     }
 
     private static String readAll(InputStream in) throws Exception {
